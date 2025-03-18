@@ -44,10 +44,10 @@ class DCRLConfig:
     soft_tau_update: float = 0.005
     policy_delay: int = 2
 
-    l: jnp.ndarray = jnp.ones((2,), dtype=jnp.float32)
+    l: jnp.ndarray = jnp.ones((2, 1, 1), dtype=jnp.float32)
     delta_t: float = 0.05
     t_max: float = 10
-    t_fix: jnp.ndarray = 0.25*jnp.arange(1, 9, dtype=jnp.float32)[:, None] # d x 1
+    t_fix: jnp.ndarray = 0.25*jnp.arange(1, 9, dtype=jnp.float32)[None, :] # 1 x d
 
 
 class DCRLEmitterState(EmitterState):
@@ -149,7 +149,7 @@ class DCRLEmitter(Emitter):
                 transitions.obs, 
                 transitions.actions, 
                 transitions.desc_prime
-                )[..., None] # W_p: batch x D x d x 1
+                )[:, :, :, None] # W_p: batch x D x d x 1
             
             successor_actions = actor_network.apply(
                 target_actor_params, 
@@ -260,12 +260,17 @@ class DCRLEmitter(Emitter):
         )
         replay_buffer = replay_buffer.insert(transitions)
 
-        # V, B, S calculation, double precision
-        t = jnp.linspace(0, self._config.t_max, 16384, dtype=jnp.float64)[None, :]
-        time_discount = jnp.exp(jnp.log(0.99)*t/self._config.delta_t)[None, :] # 1 x 1 x N
-        t1 = jnp.where(t - self._config.t_fix > 0, self._config.t_fix, t) # d x 1
-        t2 = jnp.where(t - self._config.t_fix < 0, self._config.t_fix, t) # d x 1
-        # p_tau = 
+        # V, B, S calculation
+        t = jnp.linspace(self._config.delta_t, self._config.t_max, 2048, dtype=jnp.float32)[:, None] # N x 1
+        time_discount = jnp.exp(jnp.log(0.99)*t/self._config.delta_t).reshape(1, -1, 1, 1) # 1 x N x 1 x 1
+        
+        P = self._kernel(t, self._config.t_fix, self._config.l) # D x N x d x 1
+        Q = self._kernel(t, self._config.t_fix + self._config.delta_t, self._config.l) # D x N x d x 1
+
+        S = jnp.mean(time_discount * (P @ jnp.swapaxes(P, -1, -2)), axis=1) # D x d x d
+        V = jnp.mean(time_discount * jnp.swapaxes(P, -1, -2), axis=1) # D x 1 x d
+        B = jnp.mean(time_discount * (Q @ jnp.swapaxes(P, -1, -2)), axis=1) # D x d x d
+
 
         # Initial training state
         key, subkey = jax.random.split(key)
@@ -278,9 +283,27 @@ class DCRLEmitter(Emitter):
             target_actor_params=target_actor_params,
             replay_buffer=replay_buffer,
             key=subkey,
+            S=S,
+            V=V,
+            B=B,
+            l=self._config.l,
         )
 
         return emitter_state
+    
+
+    @partial(jax.jit, static_argnames=("self",))
+    def _kernel(self, t: jnp.ndarray, t_fix: jnp.ndarray, l: jnp.ndarray) -> jnp.ndarray:
+        # t: N x 1
+        # t_fix: 1 x d
+        # l: D x 1 x 1
+
+        t1 = jnp.where(t - t_fix < 0, t, t_fix) / l # D x N x d
+        t2 = jnp.where(t - t_fix > 0, t, t_fix) / l # D x N x d
+
+        # result: D x N x d x 1
+
+        return (jnp.exp(-t1) + jnp.exp(-t2) - jnp.exp(t1 - t2) - 1 + 2*t1)[..., None]
 
 
     @partial(jax.jit, static_argnames=("self",))
